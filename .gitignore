@@ -1,0 +1,16 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# unnessesary Jupyter Notebook files
+.ipynb_checkpoints
+
+# Project specific files folders
+*.csv
+*.json
+/Verwaltungseinheiten/
+/minimal-mvt/
+/data/
+/my_docs/
+/my_scripts/

@@ -42,16 +42,16 @@ class VectorTiler:
             if self.geom_srid != self.pbf_srid:     
                 print("Geom will be reprojected to: ", self.pbf_srid, " for each tile requested")
 
+            # add srid information to self.table to simplify subsequent query string generation
+            self.table["pbf_srid"] = self.pbf_srid
+            self.table["geom_srid"] = self.geom_srid
+            
             # get bounding box
             cur.execute(self._sql_geojson_bbox())
             geojson_bbox = cur.fetchone()[0]
             self.bbox = self._parse_geojson_bbox(geojson_bbox)
         
         conn.close()   
-
-        # add srid information to self.table to simplify query string generation
-        self.table["pbf_srid"] = self.pbf_srid
-        self.table["geom_srid"] = self.geom_srid
 
 
     def _read_configs(self, config_file):
@@ -60,7 +60,9 @@ class VectorTiler:
         return configs
 
     def _sql_geojson_bbox(self):
-        return 'SELECT ST_AsGeoJSON(ST_Envelope({geom_column})) FROM {table};'.format(**self.table)
+        query = '''SELECT ST_AsGeoJSON(ST_Envelope(ST_Transform({geom_column}, {pbf_srid}))) 
+                    FROM {table};'''.format(**self.table)
+        return query
 
 
     def _parse_geojson_bbox(self, geojson_bbox):
@@ -245,7 +247,7 @@ class VectorTiler:
 
                 with open(tile_path / tile_name, "wb") as f:
                     f.write(pbf)
-            
+
         # close db connection
         cur.close()
         conn.close()

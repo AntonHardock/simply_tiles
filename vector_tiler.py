@@ -8,64 +8,59 @@ import warnings
 from tqdm import tqdm 
 
 #-------------------------------------------------------------------------------------------
-# Parse database configurations
-#-------------------------------------------------------------------------------------------
-with open("db_config.json") as json_data_file:
-    configs = json.load(json_data_file)
-
-DATABASE = configs["DATABASE"]
-TABLE = configs["TABLE"]
-HOST = configs["HOST"]
-PORT = configs["PORT"]
-
-#-------------------------------------------------------------------------------------------
 # Define Class that generates vector tilesets
 #-------------------------------------------------------------------------------------------
+
 class VectorTiler:
 
     '''Assumes quadratic coordinate (x-axis and y-axis are of equal length)'''
 
-    def __init__(self, crs_max, pbf_srid, densify_factor=4, reproject=True):
+    def __init__(self, config_file, crs_max, pbf_srid, densify_factor=4):
         
-        # initialize class attributes
+        
+        # initialize database related attributes  
+        configs = self._read_configs(config_file)
+        self.database = configs["DATABASE"]
+        self.table = configs["TABLE"]
+
+        # initialize geometry related attributes
         self.crs_min, self.crs_max = crs_max * -1,  crs_max        
         self.pbf_srid = str(pbf_srid)
         self.densify_factor = densify_factor
         self.geom_srid = None
         self.bbox = None
-        self.geom_is_reprojected = False
-
-        # create internal version of TABLE to add and modify information
-        self.tbl = TABLE.copy()
-        self.tbl["pbf_srid"] = self.pbf_srid
 
         # derive further attributes from db 
-        conn = psycopg2.connect(**DATABASE) 
+        conn = psycopg2.connect(**self.database) 
         with conn.cursor() as cur:
 
             # find srid of geom
             cur.execute(self._sql_geom_srid())
             self.geom_srid = cur.fetchone()[0]
+            print("Geom has following srid: ", self.geom_srid)
+            
+            if self.geom_srid != self.pbf_srid:     
+                print("Geom will be reprojected to: ", self.pbf_srid, " for each tile requested")
 
-            # reproject geom if pbf srid deviates
-            if (reproject) and (self.geom_srid != self.pbf_srid):
-                print("Geom has following srid: ", self.geom_srid)
-                print("A reprojected copy was created. It will be used for tiling and deleted after completion.")
-                cur.execute(self._sql_reproject_geom())
-                self.tbl['geom_column'] = TABLE['geom_column'] + '_' + self.pbf_srid + '_temp'
-                self.geom_is_reprojected = True
-                
             # get bounding box
-            # CAUTION, IF REPROJECTED THEN THE OTHER GEOM SHALL BE USED!
             cur.execute(self._sql_geojson_bbox())
             geojson_bbox = cur.fetchone()[0]
             self.bbox = self._parse_geojson_bbox(geojson_bbox)
         
-        conn.close()      
+        conn.close()   
 
+        # add srid information to self.table to simplify query string generation
+        self.table["pbf_srid"] = self.pbf_srid
+        self.table["geom_srid"] = self.geom_srid
+
+
+    def _read_configs(self, config_file):
+        with open(config_file, mode="r") as json_data_file:
+            configs = json.load(json_data_file)
+        return configs
 
     def _sql_geojson_bbox(self):
-        return 'SELECT ST_AsGeoJSON(ST_Envelope({geom_column})) FROM {table};'.format(**self.tbl)
+        return 'SELECT ST_AsGeoJSON(ST_Envelope({geom_column})) FROM {table};'.format(**self.table)
 
 
     def _parse_geojson_bbox(self, geojson_bbox):
@@ -83,21 +78,11 @@ class VectorTiler:
 
 
     def _sql_geom_srid(self):
-        return 'SELECT ST_SRID({geom_column}) FROM {table};'.format(**self.tbl)
+        return 'SELECT ST_SRID({geom_column}) FROM {table};'.format(**self.table)
 
 
-    def _sql_reproject_geom(self):
-        return '''
-            ALTER TABLE {table}
-                DROP COLUMN IF EXISTS {geom_column}_{pbf_srid}_temp,
-                ADD COLUMN {geom_column}_{pbf_srid}_temp geometry(Geometry, {pbf_srid});
-                            
-            UPDATE {table} SET 
-                {geom_column}_{pbf_srid}_temp = ST_Transform({geom_column}, {pbf_srid});
-            '''.format(**self.tbl)
-    
     #-----------------------------------------------------------------------------------------------
-    # functions to create a single pbf file according to zoom level, x and y
+    # methods to create a single pbf file according to zoom level, x and y
     #-----------------------------------------------------------------------------------------------
 
     def tile_to_envelope(self, z, x, y):
@@ -126,7 +111,7 @@ class VectorTiler:
         3) Convert to MVT format
         '''
         
-        tbl = self.tbl.copy()
+        tbl = self.table.copy()
         tbl['env'] = self._sql_envelope_to_bounds(env)
         
         return  """
@@ -136,10 +121,10 @@ class VectorTiler:
                     {env}::box2d AS b2d
             ),
             mvtgeom AS (
-                SELECT ST_AsMVTGeom(t.{geom_column}, bounds.b2d) AS geom, 
+                SELECT ST_AsMVTGeom(ST_Transform(t.{geom_column}, {pbf_srid}), bounds.b2d) AS geom, 
                     {attr_columns}
                 FROM {table} t, bounds
-                WHERE ST_Intersects(t.{geom_column}, bounds.geom)
+                WHERE ST_Intersects(t.{geom_column}, ST_Transform(bounds.geom, {geom_srid}))
             ) 
             SELECT ST_AsMVT(mvtgeom.*) FROM mvtgeom
         """.format(**tbl)
@@ -155,7 +140,7 @@ class VectorTiler:
             '''.format(**env)
     
     #-----------------------------------------------------------------------------------------------
-    # functions finding all relevant grid ids, given a bounding box and zoom level
+    # methods finding all relevant grid ids, given a bounding box and zoom level
     #-----------------------------------------------------------------------------------------------
 
     def find_axes_cutpoints(self, zoom_level):
@@ -164,6 +149,7 @@ class VectorTiler:
         cutpoints = np.linspace(self.crs_min, self.crs_max, endpoint=False, num=n_cutpoints)
         cutpoints = np.append(cutpoints, self.crs_max)
         return cutpoints
+
 
     def find_grid_intervals(self, cutpoints):
         
@@ -208,7 +194,7 @@ class VectorTiler:
         return grid_id
 
     #-----------------------------------------------------------------------------------------------
-    # Outlines of callback function iterating through z, x and y
+    #  method creating single tiles, iterating through z, x and y
     #-----------------------------------------------------------------------------------------------
 
     def generate_tileset(self, path, tileset_name, zoomlevel_range=(0,15)):
@@ -243,7 +229,7 @@ class VectorTiler:
                 os.mkdir(zoom_level_path / str(x))
             
             # for each x and y combination of grid_ids at current zoom level, create corresponding folders and files
-            conn = psycopg2.connect(**DATABASE)
+            conn = psycopg2.connect(**self.database)
             cur = conn.cursor()
 
             for x, y in tqdm(grid_id_combinations):
@@ -259,14 +245,6 @@ class VectorTiler:
 
                 with open(tile_path / tile_name, "wb") as f:
                     f.write(pbf)
-
-        # delete reprojected geom from source db  
-        if self.geom_is_reprojected:
-            
-            sql = '''
-            ALTER TABLE {table} 
-                DROP COLUMN {geom_column}_{pbf_srid}_temp;'''.format(**self.tbl)
-            cur.execute(sql)
             
         # close db connection
         cur.close()
@@ -275,7 +253,7 @@ class VectorTiler:
         return None
 
     #-----------------------------------------------------------------------------------------------
-    # Additional functions to visualize tiling in a given Tile Matrix Set for debugging purposes
+    # methods to visualize tiling of a given zoom level for debugging purposes
     #-----------------------------------------------------------------------------------------------
 
     def _find_axes_ranges(self, cutpoints, grid_intervals):

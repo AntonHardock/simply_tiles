@@ -245,8 +245,9 @@ class VectorTiler:
                 cur.execute(sql)
                 pbf = cur.fetchone()[0]
 
-                with open(tile_path / tile_name, "wb") as f:
-                    f.write(pbf)
+                if len(pbf) > 1:
+                    with open(tile_path / tile_name, "wb") as f:
+                        f.write(pbf)
 
         # close db connection
         cur.close()

@@ -21,7 +21,7 @@ class VectorTiler:
         # initialize database related attributes  
         configs = self._read_configs(config_file)
         self.database = configs["DATABASE"]
-        self.table = configs["TABLE"]
+        self.layers = configs["LAYERS"]
 
         # initialize geometry related attributes
         self.crs_min, self.crs_max = crs_max * -1,  crs_max        
@@ -35,19 +35,19 @@ class VectorTiler:
         with conn.cursor() as cur:
 
             # find srid of geom
-            cur.execute(self._sql_geom_srid())
-            self.geom_srid = cur.fetchone()[0]
-            print("Geom has following srid: ", self.geom_srid)
+            # cur.execute(self._sql_geom_srid())
+            # self.geom_srid = cur.fetchone()[0]
+            # print("Geom has following srid: ", self.geom_srid)
             
-            if self.geom_srid != self.pbf_srid:     
-                print("Geom will be reprojected to: ", self.pbf_srid, " for each tile requested")
+            # if self.geom_srid != self.pbf_srid:     
+            #     print("Geom will be reprojected to: ", self.pbf_srid, " for each tile requested")
 
-            # add srid information to self.table to simplify subsequent query string generation
-            self.table["pbf_srid"] = self.pbf_srid
-            self.table["geom_srid"] = self.geom_srid
+            # # add srid information to self.table to simplify subsequent query string generation
+            # self.table["pbf_srid"] = self.pbf_srid
+            # self.table["geom_srid"] = self.geom_srid
             
             # get bounding box
-            cur.execute(self._sql_geojson_bbox())
+            cur.execute(self._query_geojson_extent())
             geojson_bbox = cur.fetchone()[0]
             self.bbox = self._parse_geojson_bbox(geojson_bbox)
         
@@ -59,87 +59,125 @@ class VectorTiler:
             configs = json.load(json_data_file)
         return configs
 
-    def _sql_geojson_bbox(self):
-        query = '''SELECT ST_AsGeoJSON(ST_Envelope(ST_Transform({geom_column}, {pbf_srid}))) 
-                    FROM {table};'''.format(**self.table)
-        return query
+    
+    def _query_geojson_extent(self) -> str: 
+        '''Returns SQL query to request the bounding box (as GeoJSON)
+        of geometries across all specified tables (union).
+        '''
+
+        geom = '''SELECT {table}.{geom} AS geom FROM {table} '''
+        geoms = [geom.format(**layer) for layer in self.layers.values()]
+        geoms = " UNION ".join(geoms)
+        
+        return '''WITH geoms AS ({}) SELECT ST_AsGeoJSON(ST_Extent(geom), 9, 1) FROM geoms;'''.format(geoms)
 
 
-    def _parse_geojson_bbox(self, geojson_bbox):
-       
-        bbox = json.loads(geojson_bbox)
-        coords = bbox["coordinates"][0][:-1] #contains coordinates in following order: "xmin,ymin", "xmin,ymax", "xmax,ymax", "xmax,ymin"
-        coords = np.array(coords) #construct coordinate matrix to simplify extraction of min and max coordinates, first column is x, second is y
-        bbox = {
-            "xmin": coords[:, 0].min(), 
-            "xmax": coords[:, 0].max(),
-            "ymin": coords[:, 1].min(),
-            "ymax": coords[:, 1].max()  
-        }
+    def _parse_geojson_bbox(self, geojson_extent:str) -> dict:
+        '''Returns a bbox as dictionary, parsed from the extent
+        as returned by "self.query_gejson_extent"'''
+
+        geom_extent = json.loads(geojson_extent)
+        bbox = geom_extent["bbox"] #bbox as a list
+        names = ["xmin", "ymin", "xmax", "ymax"] #names of the bbox elements in corresponding order
+        bbox = {name:point for name, point in zip(names, bbox)}
+
         return bbox
 
 
     def _sql_geom_srid(self):
         return 'SELECT ST_SRID({geom_column}) FROM {table};'.format(**self.table)
 
-
     #-----------------------------------------------------------------------------------------------
     # methods to create a single pbf file according to zoom level, x and y
     #-----------------------------------------------------------------------------------------------
 
-    def tile_to_envelope(self, z, x, y):
-            
-        # Width of world in CRS
-        world_crs_size = self.crs_max - self.crs_min #assumes crs_min to be negative!
-        # Width in tiles
-        world_tile_size = 2 ** z
-        # Tile width in CRS
-        tile_crs_size = world_crs_size / world_tile_size
-        # Calculate geographic bounds from tile coordinates
-        # XYZ tile coordinates are in "image space" so origin is
-        # top-left, not bottom right
+    def calculate_tile_envelope(self, z:int, x:int, y:int) -> dict:
+    
+        '''
+        "Calculate geographic tile bounds from tile coordinates.
+        XYZ tile coordinates are in "image space" so origin is
+        top-left, not bottom right"
+        (Paul Ramsay: https://github.com/pramsey/minimal-mvt)
+        '''
+
+        world_crs_size = self.crs_max - self.crs_min # Width of world in CRS - assumes crs_min to be negative!
+        world_tile_size = 2 ** z  # Width in tiles
+        tile_crs_size = world_crs_size / world_tile_size # Tile width in CRS
+
         env = dict()
         env['pbf_srid'] = self.pbf_srid
         env['xmin'] = self.crs_min + tile_crs_size * x
         env['xmax'] = self.crs_min + tile_crs_size * (x + 1)
         env['ymin'] = self.crs_max - tile_crs_size * (y + 1)
         env['ymax'] = self.crs_max - tile_crs_size * (y)
+
         return env
-   
-    def sql_envelope(self, env):
-        ''' Translates tile envelope to sql query, which includes the following steps:
-        1) Materialize the bounds
-        2) Select the relevant geometry and clip to MVT bounds
-        3) Convert to MVT format
+
+
+    def _sql_envelope(self, env:dict) -> str:
+        
+        '''Returns a SQL query fragment. 
+        It constructs a rectangle polygon geometry based on tile envelope parameters.
+        The edges are densified, meaning that the polygon will have more coordinates
+        than needed to define the envelope. This is done so that
+        the envelope "can be safely converted to other coordinate systems"
+        (see Paul Ramsay: https://github.com/pramsey/minimal-mvt)
         '''
         
-        tbl = self.table.copy()
-        tbl['env'] = self._sql_envelope_to_bounds(env)
-        
-        return  """
-            WITH 
-            bounds AS (
-                SELECT {env} AS geom, 
-                    {env}::box2d AS b2d
-            ),
-            mvtgeom AS (
-                SELECT ST_AsMVTGeom(ST_Transform(t.{geom_column}, {pbf_srid}), bounds.b2d) AS geom, 
-                    {attr_columns}
-                FROM {table} t, bounds
-                WHERE ST_Intersects(t.{geom_column}, ST_Transform(bounds.geom, {geom_srid}))
-            ) 
-            SELECT ST_AsMVT(mvtgeom.*) FROM mvtgeom
-        """.format(**tbl)
-
-    def _sql_envelope_to_bounds(self, env):
-        '''Add explanation of author what densifying means and why it is neccessary
-        This is only a partial sql statement, that is inserted in another one, so not ; at the end'''
-        
         env['seg_size'] = (env['xmax'] - env['xmin']) / self.densify_factor
+        return 'ST_Segmentize(ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {pbf_srid}), {seg_size})'.format(**env)
+        
 
+    def _sql_mvt_layer(self, layer:dict) -> str:
+        '''Returns a SQL query fragment. 
+        It defines a single layer, consisting of the MVT-encoded geom 
+        together with optional attributes.
+        '''
+
+        layer = layer.copy() #copy avoids permanent modification of the input
+        attribute_list = layer["attributes"]
+
+        if attribute_list: 
+
+            layer["attributes"] = ", ".join(attribute_list)
+
+            return '''SELECT ST_AsMVTGeom({table}.{geom},bbox.b2d) AS geom, {attributes}
+            FROM {table}, bbox
+            WHERE ST_Intersects({table}.geom, bbox.geom)'''.format(**layer)
+
+        else:
+
+            return '''SELECT ST_AsMVTGeom({table}.{geom},bbox.b2d) AS geom
+            FROM {table}, bbox
+            WHERE ST_Intersects({table}.{geom}, bbox.geom)'''.format(**layer)
+            
+
+    def _sql_mvtcomposite(self, layers:dict):
+        '''Returns a SQL query fragment.
+        The fragment combines single layer queries into one sql result set.
+        '''
+
+        layers = [self._sql_mvt_layer(layer) for layer in self.layers.values()]
+        return " \nUNION \n".join(layers)
+
+
+    def query_tile(self, env:dict):
+        ''' 
+        Assembles full sql query to request a vector tile 
+        using the union of all provided tables and given the envelope parameters
+        Thanks to Shahzad Bacha for demonstrating the required query logic:
+        https://medium.com/@shahzadbacha.gis/composite-mvt-tiles-with-postgis-4b30d6c9f510
+        '''
+        
+        env = self._sql_envelope(env)
+        mvtcomposite = self._sql_mvtcomposite(self.layers)
+        
         return '''
-            ST_Segmentize(ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {pbf_srid}), {seg_size})
-            '''.format(**env)
+                WITH 
+                    bbox AS (SELECT {0}::box2d AS b2d, {0} AS geom),
+                    mvtcomposite AS ({1}) 
+                SELECT ST_AsMVT(mvtcomposite.*,'composite') FROM mvtcomposite ;
+                '''.format(env, mvtcomposite)
     
     #-----------------------------------------------------------------------------------------------
     # methods finding all relevant grid ids, given a bounding box and zoom level
@@ -239,8 +277,8 @@ class VectorTiler:
                 tile_path = zoom_level_path / str(x)
                 tile_name = str(y) + ".pbf"
                 
-                env = self.tile_to_envelope(z, x, y)
-                sql = self.sql_envelope(env)
+                env = self.calculate_tile_envelope(z, x, y)
+                sql = self.query_tile(env)
 
                 cur.execute(sql)
                 pbf = cur.fetchone()[0]
@@ -334,4 +372,5 @@ class VectorTiler:
         print("corresponding axes values:", axes_ranges)
 
         plt.show()
+
 

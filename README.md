@@ -1,2 +1,2 @@
 # simply_tiles
-Create vector tiles using Python and PostGIS
+Create static vector tile caches using Python and PostGIS

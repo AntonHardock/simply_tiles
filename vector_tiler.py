@@ -134,7 +134,7 @@ class VectorTiler:
         together with optional attributes.
         '''
 
-        layer = layer.copy() #copy avoids permanent modification of the input
+        layer = layer.copy() # avoids permanent modification of the input
         attribute_list = layer["attributes"]
 
         if attribute_list: 
@@ -143,13 +143,13 @@ class VectorTiler:
 
             return '''SELECT ST_AsMVTGeom({table}.{geom},bbox.b2d) AS geom, {attributes}
             FROM {table}, bbox
-            WHERE ST_Intersects({table}.geom, bbox.geom)'''.format(**layer)
+            WHERE {table}.{geom} && bbox.geom'''.format(**layer)
 
         else:
 
             return '''SELECT ST_AsMVTGeom({table}.{geom},bbox.b2d) AS geom
             FROM {table}, bbox
-            WHERE ST_Intersects({table}.{geom}, bbox.geom)'''.format(**layer)
+            WHERE {table}.{geom} && bbox.geom'''.format(**layer)
             
 
     def _sql_mvtcomposite(self, layers:dict):

@@ -8,6 +8,15 @@ import warnings
 from tqdm import tqdm 
 
 #-------------------------------------------------------------------------------------------
+# Module constants
+#-------------------------------------------------------------------------------------------
+
+EPSG_BOUNDS = {
+    "3857": {"srid":3857, "xmin":-20037508.342789, "ymin":-20037508.342789, "xmax":20037508.342789, "ymax":20037508.342789},
+    "4326": {"srid":4326, "xmin":-180, "ymin":-90, "xmax":180, "ymax":90}
+}
+
+#-------------------------------------------------------------------------------------------
 # Define Class that generates vector tilesets
 #-------------------------------------------------------------------------------------------
 
@@ -15,7 +24,7 @@ class VectorTiler:
 
     '''Assumes quadratic coordinate (x-axis and y-axis are of equal length)'''
 
-    def __init__(self, config_file, crs_max, pbf_srid, densify_factor=4):
+    def __init__(self, config_file, pbf_srid):
         
         
         # initialize database related attributes  
@@ -24,12 +33,17 @@ class VectorTiler:
         self.layers = configs["LAYERS"]
 
         # initialize geometry related attributes
-        self.crs_min, self.crs_max = crs_max * -1,  crs_max        
         self.pbf_srid = str(pbf_srid)
-        self.densify_factor = densify_factor
-        self.geom_srid = None
+        self.bounds = EPSG_BOUNDS[self.pbf_srid]
         self.bbox = None
 
+        # LEGACY (needed for debugging funcitonality, that only works with quadratic crs!!!)
+        self.crs_min = self.bounds["xmin"]  
+        self.crs_max = self.bounds["xmax"]
+  
+        # LEGACY (needed to detect deviating geom srid's, but obsolete when the generalized view is used beforehand!)
+        self.geom_srid = None
+        
         # derive further attributes from db 
         conn = psycopg2.connect(**self.database) 
         with conn.cursor() as cur:
@@ -84,49 +98,20 @@ class VectorTiler:
         return bbox
 
 
-    def _sql_geom_srid(self):
+    def query_geom_srid(self):
         return 'SELECT ST_SRID({geom_column}) FROM {table};'.format(**self.table)
 
     #-----------------------------------------------------------------------------------------------
     # methods to create a single pbf file according to zoom level, x and y
     #-----------------------------------------------------------------------------------------------
 
-    def calculate_tile_envelope(self, z:int, x:int, y:int) -> dict:
-    
-        '''
-        "Calculate geographic tile bounds from tile coordinates.
-        XYZ tile coordinates are in "image space" so origin is
-        top-left, not bottom right"
-        (Paul Ramsay: https://github.com/pramsey/minimal-mvt)
-        '''
+    def _sql_tile_envelope(self, z:int, x:int, y:int) -> str:
+        '''Returns a SQL query fragment.
+        It defines a tile envelope given z, y, x and self.pbf_srid'''
 
-        world_crs_size = self.crs_max - self.crs_min # Width of world in CRS - assumes crs_min to be negative!
-        world_tile_size = 2 ** z  # Width in tiles
-        tile_crs_size = world_crs_size / world_tile_size # Tile width in CRS
+        env = 'ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {srid})'.format(**self.bounds)
+        return 'ST_TileEnvelope({0}, {1}, {2}, {3})'.format(z, x, y, env)
 
-        env = dict()
-        env['pbf_srid'] = self.pbf_srid
-        env['xmin'] = self.crs_min + tile_crs_size * x
-        env['xmax'] = self.crs_min + tile_crs_size * (x + 1)
-        env['ymin'] = self.crs_max - tile_crs_size * (y + 1)
-        env['ymax'] = self.crs_max - tile_crs_size * (y)
-
-        return env
-
-
-    def _sql_envelope(self, env:dict) -> str:
-        
-        '''Returns a SQL query fragment. 
-        It constructs a rectangle polygon geometry based on tile envelope parameters.
-        The edges are densified, meaning that the polygon will have more coordinates
-        than needed to define the envelope. This is done so that
-        the envelope "can be safely converted to other coordinate systems"
-        (see Paul Ramsay: https://github.com/pramsey/minimal-mvt)
-        '''
-        
-        env['seg_size'] = (env['xmax'] - env['xmin']) / self.densify_factor
-        return 'ST_Segmentize(ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {pbf_srid}), {seg_size})'.format(**env)
-        
 
     def _sql_mvt_layer(self, layer:dict) -> str:
         '''Returns a SQL query fragment. 
@@ -152,7 +137,7 @@ class VectorTiler:
             WHERE {table}.{geom} && bbox.geom'''.format(**layer)
             
 
-    def _sql_mvtcomposite(self, layers:dict):
+    def _sql_mvtcomposite(self, layers:dict) -> str:
         '''Returns a SQL query fragment.
         The fragment combines single layer queries into one sql result set.
         '''
@@ -161,15 +146,15 @@ class VectorTiler:
         return " \nUNION \n".join(layers)
 
 
-    def query_tile(self, env:dict):
+    def query_tile(self, z:int, x:int, y:int) -> str:
         ''' 
-        Assembles full sql query to request a vector tile 
-        using the union of all provided tables and given the envelope parameters
+        Assembles sql query to request a vector tile 
+        using the union of all provided tables and given specified envelope parameters
         Thanks to Shahzad Bacha for demonstrating the required query logic:
         https://medium.com/@shahzadbacha.gis/composite-mvt-tiles-with-postgis-4b30d6c9f510
         '''
         
-        env = self._sql_envelope(env)
+        env = self._sql_tile_envelope(z, x, y)
         mvtcomposite = self._sql_mvtcomposite(self.layers)
         
         return '''
@@ -277,8 +262,7 @@ class VectorTiler:
                 tile_path = zoom_level_path / str(x)
                 tile_name = str(y) + ".pbf"
                 
-                env = self.calculate_tile_envelope(z, x, y)
-                sql = self.query_tile(env)
+                sql = self.query_tile(z, x, y)
 
                 cur.execute(sql)
                 pbf = cur.fetchone()[0]

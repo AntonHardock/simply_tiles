@@ -11,7 +11,7 @@ from tqdm import tqdm
 # Module constants
 #-------------------------------------------------------------------------------------------
 
-EPSG_BOUNDS = {
+EPSG_EXTENT = {
     "3857": {"srid":3857, "xmin":-20037508.342789, "ymin":-20037508.342789, "xmax":20037508.342789, "ymax":20037508.342789},
     "4326": {"srid":4326, "xmin":-180, "ymin":-90, "xmax":180, "ymax":90}
 }
@@ -26,7 +26,6 @@ class VectorTiler:
 
     def __init__(self, config_file, pbf_srid):
         
-        
         # initialize database related attributes  
         configs = self._read_configs(config_file)
         self.database = configs["DATABASE"]
@@ -34,12 +33,13 @@ class VectorTiler:
 
         # initialize geometry related attributes
         self.pbf_srid = str(pbf_srid)
-        self.bounds = EPSG_BOUNDS[self.pbf_srid]
-        self.bbox = None
+        self.epsg_extent = EPSG_EXTENT[self.pbf_srid]
+        self.bbox_wgs84 = None
+        self.bbox_transformed = None
 
         # LEGACY (needed for debugging funcitonality, that only works with quadratic crs!!!)
-        self.crs_min = self.bounds["xmin"]  
-        self.crs_max = self.bounds["xmax"]
+        self.crs_min = self.epsg_extent["xmin"]  
+        self.crs_max = self.epsg_extent["xmax"]
   
         # LEGACY (needed to detect deviating geom srid's, but obsolete when the generalized view is used beforehand!)
         self.geom_srid = None
@@ -47,24 +47,19 @@ class VectorTiler:
         # derive further attributes from db 
         conn = psycopg2.connect(**self.database) 
         with conn.cursor() as cur:
-
-            # find srid of geom
-            # cur.execute(self._sql_geom_srid())
-            # self.geom_srid = cur.fetchone()[0]
-            # print("Geom has following srid: ", self.geom_srid)
             
-            # if self.geom_srid != self.pbf_srid:     
-            #     print("Geom will be reprojected to: ", self.pbf_srid, " for each tile requested")
-
-            # # add srid information to self.table to simplify subsequent query string generation
-            # self.table["pbf_srid"] = self.pbf_srid
-            # self.table["geom_srid"] = self.geom_srid
-            
-            # get bounding box
-            cur.execute(self._query_geojson_extent())
+            # get bounding box in target projection (needed for tile generation)
+            cur.execute(self._query_geojson_extent(self.pbf_srid))
             geojson_bbox = cur.fetchone()[0]
             self.bbox = self._parse_geojson_bbox(geojson_bbox)
-        
+            self.bbox['srid'] = self.pbf_srid
+
+            # get bounding box in wgs84 (needed for temporary table creation)
+            cur.execute(self._query_geojson_extent("4326"))
+            geojson_bbox = cur.fetchone()[0]
+            self.bbox_wgs84 = self._parse_geojson_bbox(geojson_bbox)
+            self.bbox_wgs84['srid'] = '4326'
+
         conn.close()   
 
 
@@ -74,12 +69,13 @@ class VectorTiler:
         return configs
 
     
-    def _query_geojson_extent(self) -> str: 
+    def _query_geojson_extent(self, srid:str) -> str: 
         '''Returns SQL query to request the bounding box (as GeoJSON)
         of geometries across all specified tables (union).
+        Geometries are reprojected given specified srid.
         '''
 
-        geom = '''SELECT {table}.{geom} AS geom FROM {table} '''
+        geom = 'SELECT ST_Transform({table}.{geom}, ' + srid + ') AS geom FROM {table}'
         geoms = [geom.format(**layer) for layer in self.layers.values()]
         geoms = " UNION ".join(geoms)
         
@@ -97,10 +93,6 @@ class VectorTiler:
 
         return bbox
 
-
-    def query_geom_srid(self):
-        return 'SELECT ST_SRID({geom_column}) FROM {table};'.format(**self.table)
-
     #-----------------------------------------------------------------------------------------------
     # methods to create a single pbf file according to zoom level, x and y
     #-----------------------------------------------------------------------------------------------
@@ -109,7 +101,7 @@ class VectorTiler:
         '''Returns a SQL query fragment.
         It defines a tile envelope given z, y, x and self.pbf_srid'''
 
-        env = 'ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {srid})'.format(**self.bounds)
+        env = 'ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {srid})'.format(**self.epsg_extent)
         return 'ST_TileEnvelope({0}, {1}, {2}, {3})'.format(z, x, y, env)
 
 
@@ -164,6 +156,58 @@ class VectorTiler:
                 SELECT ST_AsMVT(mvtcomposite.*,'composite') FROM mvtcomposite ;
                 '''.format(env, mvtcomposite)
     
+
+    #-----------------------------------------------------------------------------------------------
+    # alternative methods to create a single pbf file, using a temporary table
+    #-----------------------------------------------------------------------------------------------
+
+    def query_temporary_table(self):
+        '''
+        https://stackoverflow.com/questions/24243887/create-in-withcte-using-postgresql
+        probably add densify parameter for envelope!!! (but probably not needed since only bbox intersection is used)
+        '''
+  
+        # update each layer dict with "pbf_srid":self.pbf_srid
+        layers = self.layers.copy()
+        for layer in layers.values():
+            layer["pbf_srid"] = self.pbf_srid
+
+        # sql query for union of all selected tables
+        table = '''SELECT ST_Transform({table}.{geom}, {pbf_srid}) AS geom FROM {table} '''
+        table_union = [table.format(**layer) for layer in self.layers.values()]
+        table_union = " UNION ".join(table_union)
+        
+        # bounding box ("common denominator bbox" by default, including all geometries
+        env_wgs84 = 'ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, 4326)'.format(**self.bbox_wgs84)
+
+        return '''CREATE TEMPORARY TABLE temp_table_for_mvt_cache AS
+
+                    WITH
+                        table_union AS ({0})
+                    SELECT * from table_union
+                    WHERE table_union.geom && ST_Transform({1}, {2});'''.format(table_union, env_wgs84, self.pbf_srid)
+
+
+    def query_tile_from_temp_table(self, z:int, x:int, y:int) -> str:
+        ''' 
+        '''
+        
+        env = self._sql_tile_envelope(z, x, y)
+        
+        return '''
+                WITH 
+                    bbox AS (
+                        SELECT {0}::box2d AS b2d, 
+                        {0} AS geom),
+                    temp_table AS (
+                        SELECT ST_AsMVTGeom(t.geom, bbox.b2d) AS geom
+                        FROM temp_table_for_mvt_cache AS t, bbox 
+                        WHERE t.geom && bbox.geom
+                    ) 
+                SELECT ST_AsMVT(temp_table.*,'composite') FROM temp_table ;
+                '''.format(env)
+
+
     #-----------------------------------------------------------------------------------------------
     # methods finding all relevant grid ids, given a bounding box and zoom level
     #-----------------------------------------------------------------------------------------------
@@ -230,6 +274,15 @@ class VectorTiler:
         tileset_path = path / tileset_name
         os.mkdir(tileset_path)
 
+        # open db connection 
+        conn = psycopg2.connect(**self.database)
+        cur = conn.cursor()
+
+        # create temporary table containing all relevant geometries and attributes
+        cur.execute(self.query_temporary_table())
+        print('Created temp union table from all specified tables')
+        print('Geoms deviating from specified pbf_srid are automatically transformed')
+
         # for each zoom level: 
         zMin, zMax = zoomlevel_range
         for z in range(zMin, zMax + 1):
@@ -254,15 +307,12 @@ class VectorTiler:
                 os.mkdir(zoom_level_path / str(x))
             
             # for each x and y combination of grid_ids at current zoom level, create corresponding folders and files
-            conn = psycopg2.connect(**self.database)
-            cur = conn.cursor()
-
             for x, y in tqdm(grid_id_combinations):
                 
                 tile_path = zoom_level_path / str(x)
                 tile_name = str(y) + ".pbf"
                 
-                sql = self.query_tile(z, x, y)
+                sql = self.query_tile_from_temp_table(z,x,y)
 
                 cur.execute(sql)
                 pbf = cur.fetchone()[0]

@@ -24,42 +24,51 @@ class VectorTiler:
 
     '''Assumes quadratic coordinate (x-axis and y-axis are of equal length)'''
 
-    def __init__(self, config_file, pbf_srid):
+    def __init__(self, config_file):
         
-        # initialize database related attributes  
         configs = self._read_configs(config_file)
+        
+        # initialize geometry related attributes
+        self.pbf_srid = str(configs["PBF_SRID"])
+        self.epsg_extent = EPSG_EXTENT[self.pbf_srid]
+
+
+        # initialize database related attributes
         self.database = configs["DATABASE"]
         self.layers = configs["LAYERS"]
 
-        # initialize geometry related attributes
-        self.pbf_srid = str(pbf_srid)
-        self.epsg_extent = EPSG_EXTENT[self.pbf_srid]
-        self.bbox_wgs84 = None
-        self.bbox_transformed = None
-
+        # update each layer config dict with "pbf_srid":self.pbf_srid, simplifying dynamic sql string generation
+        for layer in self.layers.values():
+            layer["pbf_srid"] = self.pbf_srid
+        
         # LEGACY (needed for debugging funcitonality, that only works with quadratic crs!!!)
         self.crs_min = self.epsg_extent["xmin"]  
         self.crs_max = self.epsg_extent["xmax"]
-  
-        # LEGACY (needed to detect deviating geom srid's, but obsolete when the generalized view is used beforehand!)
-        self.geom_srid = None
+          
+        # derive bounding boxes
+        self.user_bounds = configs.get("USER_BOUNDS", None)
         
-        # derive further attributes from db 
         conn = psycopg2.connect(**self.database) 
         with conn.cursor() as cur:
             
-            # get bounding box in target projection (needed for tile generation)
-            cur.execute(self._query_geojson_extent(self.pbf_srid))
-            geojson_bbox = cur.fetchone()[0]
-            self.bbox = self._parse_geojson_bbox(geojson_bbox)
-            self.bbox['srid'] = self.pbf_srid
+            if self.user_bounds: 
+                print("BBOX is derived from user defined bounds and reprojected if required.")
 
-            # get bounding box in wgs84 (needed for temporary table creation)
-            cur.execute(self._query_geojson_extent("4326"))
-            geojson_bbox = cur.fetchone()[0]
-            self.bbox_wgs84 = self._parse_geojson_bbox(geojson_bbox)
-            self.bbox_wgs84['srid'] = '4326'
+                if self.user_bounds["srid"] == self.pbf_srid:
+                    self.bbox = self.user_bounds
 
+                else:
+                    cur.execute(self._query_user_bbox())
+                    geojson_bbox = cur.fetchone()[0]
+                    self.bbox = self._parse_geojson_bbox(geojson_bbox)
+            
+            else: 
+                print("BBOX ist auto-detected across all geoms of all specified layers.")
+
+                cur.execute(self._query_autodetected_bbox())
+                geojson_bbox = cur.fetchone()[0]
+                self.bbox = self._parse_geojson_bbox(geojson_bbox)
+        
         conn.close()   
 
 
@@ -68,14 +77,31 @@ class VectorTiler:
             configs = json.load(json_data_file)
         return configs
 
+
+    def _query_user_bbox(self) -> str:
+        '''Returns bbox derived from user defined bounds (as GeoJSON).
+        Bounds need to be declared in EPSG WGS84.
+        The edges are densified for safe transformation to other coordinate systems.
+        Here, I follow the MVT Example of Paul Ramsay:
+        https://github.com/pramsey/minimal-mvt/blob/8b736e342ada89c5c2c9b1c77bfcbcfde7aa8d82/minimal-mvt.py#L84-L91
+        Though I'm not sure if densifying is generally required or if the step is only needed with EPSG 3857'''
+
+        
+        bounds = self.user_bounds.copy() #copy to avoid permanent modification of attribute
+        DENSIFY_FACTOR = 4
+        bounds['seg_size'] = (bounds['xmax'] - bounds['xmin'])/DENSIFY_FACTOR
+
+        env = 'ST_Segmentize(ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {srid}), {seg_size})'.format(**bounds)
+        return 'SELECT ST_AsGeoJSON(ST_Transform({0}, {1}), 9, 1)'.format(env, self.pbf_srid)
     
-    def _query_geojson_extent(self, srid:str) -> str: 
+
+    def _query_autodetected_bbox(self) -> str: 
         '''Returns SQL query to request the bounding box (as GeoJSON)
         of geometries across all specified tables (union).
         Geometries are reprojected given specified srid.
         '''
 
-        geom = 'SELECT ST_Transform({table}.{geom}, ' + srid + ') AS geom FROM {table}'
+        geom = 'SELECT ST_Transform({table}.{geom}, ' + self.pbf_srid + ') AS geom FROM {table}'
         geoms = [geom.format(**layer) for layer in self.layers.values()]
         geoms = " UNION ".join(geoms)
         
@@ -84,115 +110,54 @@ class VectorTiler:
 
     def _parse_geojson_bbox(self, geojson_extent:str) -> dict:
         '''Returns a bbox as dictionary, parsed from the extent
-        as returned by "self.query_gejson_extent"'''
+        as returned by "self.query_gejson_extent"
+        '''
 
         geom_extent = json.loads(geojson_extent)
         bbox = geom_extent["bbox"] #bbox as a list
         names = ["xmin", "ymin", "xmax", "ymax"] #names of the bbox elements in corresponding order
         bbox = {name:point for name, point in zip(names, bbox)}
+        bbox['srid'] = self.pbf_srid
 
         return bbox
+
 
     #-----------------------------------------------------------------------------------------------
     # methods to create a single pbf file according to zoom level, x and y
     #-----------------------------------------------------------------------------------------------
 
-    def _sql_tile_envelope(self, z:int, x:int, y:int) -> str:
-        '''Returns a SQL query fragment.
-        It defines a tile envelope given z, y, x and self.pbf_srid'''
-
-        env = 'ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {srid})'.format(**self.epsg_extent)
-        return 'ST_TileEnvelope({0}, {1}, {2}, {3})'.format(z, x, y, env)
-
-
-    def _sql_mvt_layer(self, layer:dict) -> str:
-        '''Returns a SQL query fragment. 
-        It defines a single layer, consisting of the MVT-encoded geom 
-        together with optional attributes.
-        '''
-
-        layer = layer.copy() # avoids permanent modification of the input
-        attribute_list = layer["attributes"]
-
-        if attribute_list: 
-
-            layer["attributes"] = ", ".join(attribute_list)
-
-            return '''SELECT ST_AsMVTGeom({table}.{geom},bbox.b2d) AS geom, {attributes}
-            FROM {table}, bbox
-            WHERE {table}.{geom} && bbox.geom'''.format(**layer)
-
-        else:
-
-            return '''SELECT ST_AsMVTGeom({table}.{geom},bbox.b2d) AS geom
-            FROM {table}, bbox
-            WHERE {table}.{geom} && bbox.geom'''.format(**layer)
-            
-
-    def _sql_mvtcomposite(self, layers:dict) -> str:
-        '''Returns a SQL query fragment.
-        The fragment combines single layer queries into one sql result set.
-        '''
-
-        layers = [self._sql_mvt_layer(layer) for layer in self.layers.values()]
-        return " \nUNION \n".join(layers)
-
-
-    def query_tile(self, z:int, x:int, y:int) -> str:
-        ''' 
-        Assembles sql query to request a vector tile 
-        using the union of all provided tables and given specified envelope parameters
-        Thanks to Shahzad Bacha for demonstrating the required query logic:
-        https://medium.com/@shahzadbacha.gis/composite-mvt-tiles-with-postgis-4b30d6c9f510
-        '''
-        
-        env = self._sql_tile_envelope(z, x, y)
-        mvtcomposite = self._sql_mvtcomposite(self.layers)
-        
-        return '''
-                WITH 
-                    bbox AS (SELECT {0}::box2d AS b2d, {0} AS geom),
-                    mvtcomposite AS ({1}) 
-                SELECT ST_AsMVT(mvtcomposite.*,'composite') FROM mvtcomposite ;
-                '''.format(env, mvtcomposite)
-    
-
-    #-----------------------------------------------------------------------------------------------
-    # alternative methods to create a single pbf file, using a temporary table
-    #-----------------------------------------------------------------------------------------------
-
     def query_temporary_table(self):
         '''
         https://stackoverflow.com/questions/24243887/create-in-withcte-using-postgresql
-        probably add densify parameter for envelope!!! (but probably not needed since only bbox intersection is used)
+        PROBABLY CHANGE SO THAT INTERSECTION HAPPENS BEFORE UNION!
         '''
   
-        # update each layer dict with "pbf_srid":self.pbf_srid
-        layers = self.layers.copy()
-        for layer in layers.values():
-            layer["pbf_srid"] = self.pbf_srid
+        # template to materialize envelope polygon from bounding box
+        env = 'ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {srid})'.format(**self.bbox)
 
-        # sql query for union of all selected tables
-        table = '''SELECT ST_Transform({table}.{geom}, {pbf_srid}) AS geom FROM {table} '''
+        # template to select a single layer / table with geometries intersecting the envelope
+        table = 'SELECT ST_Transform({table}.{geom}, {pbf_srid}) AS geom FROM {table}'
+        
+        # template to get the union of all tables / layers
         table_union = [table.format(**layer) for layer in self.layers.values()]
         table_union = " UNION ".join(table_union)
         
-        # bounding box ("common denominator bbox" by default, including all geometries
-        env_wgs84 = 'ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, 4326)'.format(**self.bbox_wgs84)
-
+        # assembled query string
         return '''CREATE TEMPORARY TABLE temp_table_for_mvt_cache AS
 
                     WITH
                         table_union AS ({0})
                     SELECT * from table_union
-                    WHERE table_union.geom && ST_Transform({1}, {2});'''.format(table_union, env_wgs84, self.pbf_srid)
+                    WHERE table_union.geom && {1};'''.format(table_union, env)
 
 
     def query_tile_from_temp_table(self, z:int, x:int, y:int) -> str:
-        ''' 
+        '''
+        SQL query to retrieve a vector tile from a predefined, temporary table. 
         '''
         
-        env = self._sql_tile_envelope(z, x, y)
+        level_zero_tile_env = 'ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {srid})'.format(**self.epsg_extent)
+        env = 'ST_TileEnvelope({0}, {1}, {2}, {3})'.format(z, x, y, level_zero_tile_env)
         
         return '''
                 WITH 

@@ -22,8 +22,6 @@ EPSG_EXTENT = {
 
 class VectorTiler:
 
-    '''Assumes quadratic coordinate (x-axis and y-axis are of equal length)'''
-
     def __init__(self, config_file):
         
         configs = self._read_configs(config_file)
@@ -37,10 +35,17 @@ class VectorTiler:
         self.database = configs["DATABASE"]
         self.layers = configs["LAYERS"]
 
-        # update each layer config dict with "pbf_srid":self.pbf_srid, simplifying dynamic sql string generation
+        # prepare each layer config dict to simplify filling of sql string templates
+        self.all_attributes = set()
         for layer in self.layers.values():
+            self.all_attributes.update(layer["attributes"])
+        self.all_attributes = ", ".join(self.all_attributes)
+
+        for name, layer in self.layers.items():
             layer["pbf_srid"] = self.pbf_srid
-        
+            layer["attributes"] = ", ".join(layer["attributes"])
+            layer["layername"] = name
+  
         # LEGACY (needed for debugging funcitonality, that only works with quadratic crs!!!)
         self.crs_min = self.epsg_extent["xmin"]  
         self.crs_max = self.epsg_extent["xmax"]
@@ -135,8 +140,12 @@ class VectorTiler:
         # template to materialize envelope polygon from bounding box
         env = 'ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {srid})'.format(**self.bbox)
 
-        # template to select a single layer / table with geometries intersecting the envelope
-        table = 'SELECT ST_Transform({table}.{geom}, {pbf_srid}) AS geom FROM {table}'
+        # template to select a single layer / table
+        table = """SELECT 
+                    '{layername}' AS layer, 
+                    ST_Transform({table}.{geom}, {pbf_srid}) AS geom, 
+                    {attributes}
+                    FROM {table}"""
         
         # template to get the union of all tables / layers
         table_union = [table.format(**layer) for layer in self.layers.values()]
@@ -157,20 +166,25 @@ class VectorTiler:
         '''
         
         level_zero_tile_env = 'ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {srid})'.format(**self.epsg_extent)
+        
         env = 'ST_TileEnvelope({0}, {1}, {2}, {3})'.format(z, x, y, level_zero_tile_env)
         
-        return '''
+        temp_table = """SELECT 
+                            layer, 
+                            ST_AsMVTGeom(t.geom, bbox.b2d) AS geom, 
+                            {0}
+                        FROM temp_table_for_mvt_cache AS t, bbox
+                        WHERE t.geom && bbox.geom""".format(self.all_attributes)
+
+        return """
                 WITH 
                     bbox AS (
                         SELECT {0}::box2d AS b2d, 
                         {0} AS geom),
-                    temp_table AS (
-                        SELECT ST_AsMVTGeom(t.geom, bbox.b2d) AS geom
-                        FROM temp_table_for_mvt_cache AS t, bbox 
-                        WHERE t.geom && bbox.geom
-                    ) 
-                SELECT ST_AsMVT(temp_table.*,'composite') FROM temp_table ;
-                '''.format(env)
+                    mvt_composite AS (
+                        {1}) 
+                SELECT ST_AsMVT(mvt_composite.*,'composite') FROM mvt_composite;
+                """.format(env, temp_table)
 
 
     #-----------------------------------------------------------------------------------------------

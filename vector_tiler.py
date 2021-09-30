@@ -44,7 +44,7 @@ class VectorTiler:
         for name, layer in self.layers.items():
             layer["pbf_srid"] = self.pbf_srid
             layer["attributes"] = ", ".join(layer["attributes"])
-            layer["layername"] = name
+            layer["layer_name"] = name
   
         # LEGACY (needed for debugging funcitonality, that only works with quadratic crs!!!)
         self.crs_min = self.epsg_extent["xmin"]  
@@ -142,7 +142,7 @@ class VectorTiler:
 
         # template to select a single layer / table
         table = """SELECT 
-                    '{layername}' AS layer, 
+                    '{layer_name}' AS layer, 
                     ST_Transform({table}.{geom}, {pbf_srid}) AS geom, 
                     {attributes}
                     FROM {table}"""
@@ -168,23 +168,31 @@ class VectorTiler:
         level_zero_tile_env = 'ST_MakeEnvelope({xmin}, {ymin}, {xmax}, {ymax}, {srid})'.format(**self.epsg_extent)
         
         env = 'ST_TileEnvelope({0}, {1}, {2}, {3})'.format(z, x, y, level_zero_tile_env)
-        
-        temp_table = """SELECT 
-                            layer, 
-                            ST_AsMVTGeom(t.geom, bbox.b2d) AS geom, 
-                            {0}
-                        FROM temp_table_for_mvt_cache AS t, bbox
-                        WHERE t.geom && bbox.geom""".format(self.all_attributes)
+
+        layer_template = """
+        (
+        SELECT '{0}' AS layername, ST_AsMVT(q, '{0}', 4096)   
+        FROM (
+            SELECT 
+                layer, 
+                ST_AsMVTGeom(t.geom, bbox.b2d) AS geom, 
+                {1}
+            FROM temp_table_for_mvt_cache AS t, bbox
+            WHERE layer = '{0}' 
+            AND t.geom && bbox.geom 
+            ) AS q
+        )
+        """
+
+        layer_union = [layer_template.format(layer["layer_name"], self.all_attributes) for layer in self.layers.values()] 
+        layer_union = "\nUNION\n".join(layer_union)
 
         return """
                 WITH 
                     bbox AS (
                         SELECT {0}::box2d AS b2d, 
-                        {0} AS geom),
-                    mvt_composite AS (
-                        {1}) 
-                SELECT ST_AsMVT(mvt_composite.*,'composite') FROM mvt_composite;
-                """.format(env, temp_table)
+                        {0} AS geom)
+                {1};""".format(env, layer_union)
 
 
     #-----------------------------------------------------------------------------------------------
@@ -294,11 +302,16 @@ class VectorTiler:
                 sql = self.query_tile_from_temp_table(z,x,y)
 
                 cur.execute(sql)
-                pbf = cur.fetchone()[0]
+                results = cur.fetchall()
 
-                if len(pbf) > 1:
-                    with open(tile_path / tile_name, "wb") as f:
-                        f.write(pbf)
+                results = [row[1] for row in results if len(row[1]) > 0 ] # row[1] contains the binary result as "memoryview" object 
+
+                # proceed if results is not empty
+                if results: 
+
+                    with open(tile_path / tile_name, "ab") as f:
+                        for pbf in results:
+                            f.write(pbf)
 
         # close db connection
         cur.close()

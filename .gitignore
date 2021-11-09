@@ -11,7 +11,7 @@ __pycache__/
 *.json
 /Verwaltungseinheiten/
 /minimal-mvt/
-/data/
+/my_data/
 /my_docs/
 /my_scripts/
 /vt_caches/

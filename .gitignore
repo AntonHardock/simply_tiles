@@ -6,11 +6,10 @@ __pycache__/
 # unnessesary Jupyter Notebook files
 .ipynb_checkpoints
 
-# Project specific files folders
+# Project specific files and folders
 *.csv
 *.json
 /Verwaltungseinheiten/
-/minimal-mvt/
 /my_data/
 /my_docs/
 /my_scripts/

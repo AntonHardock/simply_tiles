@@ -12,17 +12,19 @@ METERS_PER_FEET = 0.3048
 
 STANDARDIZED_PIXEL_SIZE = 0.28 # in mm, assumed to be identical for x and y axis
 
-EPSILON = 0.0000001 #used 
+EPSILON = 0.0000001 #constant used to avoid precision issues with floating point calculations
 
 ORIGIN = "top_left" #all calculations are based on the assumption that top left is the origin of tile matrix
 
 
-class Grid():
+class TileMatrixSet():
     
-    def __init__(self, width:int = None, height:int = None, 
+    def __init__(self, title:str, identifier:str, width:int = None, height:int = None, 
                  extent:dict = None, srid:int = None, units:str = None, 
                  cell_sizes:list = None, origin:str="top_left"):
         
+        self.title = title
+        self.identifier = identifier
         self.srid = srid # crs used by provided tile matrix set definition
         self.units = units # measuring unit used by given crs
         self.extent = extent # "global bbox" across all tile matrices / zoomlevels, in crs units
@@ -33,18 +35,8 @@ class Grid():
         if self.origin != "top_left":
             raise ValueError("Origin has to be 'top_left' in this implementation")
         
-        self.n_levels = len(cell_sizes) + 1 # derive number of predefined zoomlevels / tile matrices
+        self.n_levels = len(cell_sizes) # derive number of predefined zoomlevels / tile matrices
         self.max_zoom = self.n_levels - 1 # derive max zoom, taking into account zero based indexing of zoomlevels
-
-        self.grid = {
-            "width": width,
-            "height": height,
-            "extent": extent,
-            "srid": srid,
-            "units": units,
-            "cell_sizes": cell_sizes,
-            "origin": origin
-        }
 
 
     def scale_denominator(self, zoom_level:int) -> float:
@@ -57,7 +49,6 @@ class Grid():
         a given cell_size first has to be recalculated in meters (if that't not already the case)
         Then, the cell_size is simply divided by the "standardized pixel size" (also recalculated in meters).
         The result is a scale without a particular unit. 
-
         """
         
         if self.units == "meters":
@@ -85,9 +76,9 @@ class Grid():
         """
 
         # reference existing variables to match TMS Spec terminology
-        bbox_minx, bbox_maxx = bbox["minx"], bbox["maxx"]
-        bbox_miny, bbox_maxy = bbox["miny"], bbox["maxy"]
-        tile_matrix_minx, tile_matrix_maxy = self.extent["minx"], self.extent["maxy"] 
+        bbox_xmin, bbox_xmax = bbox["xmin"], bbox["xmax"]
+        bbox_ymin, bbox_ymax = bbox["ymin"], bbox["ymax"]
+        tile_matrix_xmin, tile_matrix_ymax = self.extent["xmin"], self.extent["ymax"] 
 
         # derive tile width and length in crs units
         cell_size = self.cell_sizes[zoom_level]
@@ -95,10 +86,10 @@ class Grid():
 
         # calculate tile limits
         limits = {
-            "tileMinCol": math.floor((bbox_minx - tile_matrix_minx) / tilespan_x + EPSILON),
-            "tileMaxCol": math.floor((bbox_maxx - tile_matrix_minx) / tilespan_x - EPSILON),
-            "tileMinRow": math.floor((tile_matrix_maxy - bbox_maxy) / tilespan_y + EPSILON),
-            "tileMaxRow": math.floor((tile_matrix_maxy - bbox_miny) / tilespan_y - EPSILON)
+            "tileMinCol": math.floor((bbox_xmin - tile_matrix_xmin) / tilespan_x + EPSILON),
+            "tileMaxCol": math.floor((bbox_xmax - tile_matrix_xmin) / tilespan_x - EPSILON),
+            "tileMinRow": math.floor((tile_matrix_ymax - bbox_ymax) / tilespan_y + EPSILON),
+            "tileMaxRow": math.floor((tile_matrix_ymax - bbox_ymin) / tilespan_y - EPSILON)
         }
 
         # derive total number of tiles along x and y axis
@@ -127,7 +118,7 @@ class Grid():
         (extent)"""
 
         # reference existing variables to match TMS Spec terminology
-        tile_matrix_minx, tile_matrix_maxy = self.extent["minx"], self.extent["maxy"] 
+        tile_matrix_minx, tile_matrix_maxy = self.extent["xmin"], self.extent["ymax"] 
 
         # derive tile width and length in crs units
         cell_size = self.cell_sizes[zoom_level]
@@ -135,10 +126,10 @@ class Grid():
 
         # calculate envelope
         envelope = {
-            "minx": tile_col * tilespan_x + tile_matrix_minx,
-            "miny": tile_matrix_maxy - (tile_row + 1) * tilespan_y,
-            "maxx": (tile_col + 1) * tilespan_x + tile_matrix_minx,
-            "maxy": tile_matrix_maxy - tile_row * tilespan_y
+            "xmin": tile_col * tilespan_x + tile_matrix_minx,
+            "ymin": tile_matrix_maxy - (tile_row + 1) * tilespan_y,
+            "xmax": (tile_col + 1) * tilespan_x + tile_matrix_minx,
+            "ymax": tile_matrix_maxy - tile_row * tilespan_y
         }
 
         return envelope
@@ -149,52 +140,33 @@ class Grid():
 
 if __name__ == "__main__":
 
-# '    # test general functionality
-#     from trex_grids import WEB_MERCATOR_QUAD
+    # parse config params
+    import json
 
-#     grid = Grid(**WEB_MERCATOR_QUAD)
+    with open('data/TrexCustomTMS.json', mode="r") as json_data_file:
+        tms_definition = json.load(json_data_file)
 
-#     test_bbox = {
-#         'minx': -20037508.342789248, 
-#         'miny': 0.0, 
-#         'maxx': 0.0, 
-#         'maxy': 20037508.342789248}
-        
-#     x = 0
-#     y = 0
-#     z = 1
+    tms = TileMatrixSet(**tms_definition)
 
-#     print(grid.scale_denominator(z))
-#     print(grid.cell_sizes[z])
-
-#     print(grid.tile_limits(test_bbox, z))
-#     print(grid.tile_envelope(x, y, z))'
-
-
-    # test trex custom grid
-    from trex_grids import TREX_CUSTOM_GRID_EXAMPLE
-
-    grid = Grid(**TREX_CUSTOM_GRID_EXAMPLE)
-
-    extent_width = grid.extent["maxx"] - grid.extent["minx"]
-    extent_height = grid.extent["maxy"] - grid.extent["miny"]
+    #calculate extent width and height
+    extent_width = tms.extent["xmax"] - tms.extent["xmin"]
+    extent_height = tms.extent["ymax"] - tms.extent["ymin"]
     print(extent_width, extent_height) 
 
     x = 0
     y = 0
     z = 2
 
-    #print(grid.cell_sizes[z])
-    #print(grid.scale_denominator(z))
-    print(grid.tile_limits(grid.extent, z))
+    print(tms.cell_sizes[z])
+    print(tms.scale_denominator(z))
+    print(tms.tile_limits(tms.extent, z))
 
-    env = grid.tile_envelope(x, y, z)
-    env_width = env["maxx"] - env["minx"]
-    env_height = env["maxy"] - env["miny"]
+    env = tms.tile_envelope(x, y, z)
+    env_width = env["xmax"] - env["xmin"]
+    env_height = env["ymax"] - env["ymin"]
     print(env_width, env_height)
     print(env_width / 256)
-    print(env)
-    print(grid.extent)
+    print(tms.extent)
 
 
 

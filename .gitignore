@@ -10,8 +10,5 @@ __pycache__/
 *.csv
 *.json
 /Verwaltungseinheiten/
-/my_data/
-/my_docs/
-/my_scripts/
-/vt_caches/
+/my_*/
 /qgis_projects/

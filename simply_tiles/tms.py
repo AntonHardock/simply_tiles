@@ -75,6 +75,15 @@ class TileMatrixSet():
         https://docs.opengeospatial.org/DRAFTS/17-083r3.html#from-bbox-to-tile-indices
         """
 
+        # raise error if bbox goes beyond the defined extent
+        a = (bbox["xmin"] < self.extent["xmin"])
+        b = (bbox["ymin"] < self.extent["ymin"])
+        c = (bbox["xmax"] > self.extent["xmax"])
+        d = (bbox["ymax"] > self.extent["ymax"])
+            
+        if a or b or c or d:
+            raise ValueError("Bounding Box lies beyond the TMS extent")
+       
         # reference existing variables to match TMS Spec terminology
         bbox_xmin, bbox_xmax = bbox["xmin"], bbox["xmax"]
         bbox_ymin, bbox_ymax = bbox["ymin"], bbox["ymax"]
@@ -93,18 +102,8 @@ class TileMatrixSet():
         }
 
         # derive total number of tiles along x and y axis
-        limits["matrixWidth"] = limits["tileMaxCol"] + 1
-        limits["matrixHeight"] = limits["tileMaxRow"] + 1
-
-        # correct limits in case of out-of-bounds requests
-        if (limits["tileMinCol"] < 0):
-            limits["tileMinCol"] = 0
-        if (limits["tileMaxCol"] >= limits["matrixWidth"]):
-            limits["tileMaxCol"] = limits["matrixWidth"] - 1
-        if (limits["tileMinRow"] < 0):
-            limits["tileMinRow"] = 0
-        if (limits["tileMaxRow"] >= limits["matrixHeight"]):
-            limits["tileMaxRow"] = limits["matrixHeight"] - 1
+        limits["matrixWidth"] = limits["tileMaxCol"] - limits["tileMinCol"] + 1
+        limits["matrixHeight"] = limits["tileMaxRow"] - limits["tileMinRow"] + 1
 
         return limits
 

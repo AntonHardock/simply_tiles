@@ -8,7 +8,6 @@ __pycache__/
 
 # Project specific files and folders
 *.csv
-*.json
 /Verwaltungseinheiten/
 /my_*/
 /qgis_projects/

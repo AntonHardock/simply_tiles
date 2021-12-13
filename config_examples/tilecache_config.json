@@ -1,0 +1,28 @@
+{
+
+    "TMS_DEFINITION": "./data/WebMercatorQuad.json",
+    
+    "DATABASE" : {
+        "user":     "postgres",
+        "password": "XXXXXXXXXXXXXX",
+        "host":     "localhost",
+        "port":     "5432",
+        "database": "postgres"
+    },
+    
+    "LAYERS": {
+        
+        "verwaltungseinheit" : {
+            "table": "verwaltungseinheit",
+            "geom": "geom",
+            "attributes": ["name"]
+        },
+
+        "testpunkte" : {
+            "table": "test",
+            "geom": "geom",
+            "attributes": ["name"]
+        }    
+    }
+
+}

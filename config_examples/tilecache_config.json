@@ -1,6 +1,6 @@
 {
 
-    "TMS_DEFINITION": "./data/WebMercatorQuad.json",
+    "TMS_DEFINITION": "./tms_definitions/WebMercatorQuad.json",
     
     "DATABASE" : {
         "user":     "postgres",

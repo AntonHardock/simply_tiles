@@ -4,8 +4,7 @@ import json
 from pathlib import Path
 from tqdm import tqdm 
 
-from simply_tiles.tms import TileMatrixSet
-
+from tms import TileMatrixSet
 
 class VectorTiler:
 

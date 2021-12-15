@@ -1,6 +1,6 @@
 {
 
-    "TMS_DEFINITION": "./data/WebMercatorQuad.json",
+    "TMS_DEFINITION": "./tms_definitions/WebMercatorQuad.json",
 
     "USER_BOUNDS": {"xmin": 1113000, "ymin": 7080000, "xmax": 1183000, "ymax": 7100000, "srid": 3857},
     

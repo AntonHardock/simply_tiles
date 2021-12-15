@@ -1,6 +1,6 @@
 # About
 Create static vector tile caches using Python to instruct PostGIS.
-Written in Python 3.7 with psycopg2 as the only dependency.
+Developed with Python 3.7 and PostGIS 3.0.
 
 # Configuration
 Configure tile generation (including custom Tile Matrix Sets)

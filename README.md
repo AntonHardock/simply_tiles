@@ -21,9 +21,9 @@ multiple layer caches. This is due to the current handling of sql querries and w
 # Usage
 Using a very basic CLI:
 
-'''
+```
 python ./simply_tiles/main.py "config_examples/tilecache_config.json" "example_cache_name" "path/to/my/output_folder" --max_zoom 15
-'''
+```
 
 # Docker
 The package also includes an unfinished Dockerfile soon to be completed.
